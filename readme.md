@@ -7,7 +7,6 @@
 
 Pulse is a lightweight, zero-dependency observability agent written in Go. It provides second-by-second visibility into your server's performance, process activity, network traffic, and disk I/O, visualized through a stunning, responsive web dashboard.
 
-![Pulse Dashboard](https://via.placeholder.com/1200x600.png?text=Pulse+Dashboard+Screenshot)
 
 ---
 
@@ -145,5 +144,6 @@ exit /b 0
 ---
 
 ## 📄 License
+
 
 Distributed under the MIT License.
