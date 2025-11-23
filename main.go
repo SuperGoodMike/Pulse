@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +32,7 @@ import (
 
 // --- 1. CONFIGURATION ---
 const historySeconds = 259200 // 3 Days
-const dbFile = "pulse_v27.data.gz"
+const dbFile = "pulse_v30.data.gz"
 const confFile = "pulse.conf"
 
 // --- 2. DATA STRUCTURES ---
@@ -130,18 +132,16 @@ const htmlDashboard = `
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Pulse | v27 Fixed Execution</title>
+    <title>Pulse | Enterprise Alerting</title>
     <style>
         :root { --bg: #121212; --card: #1e1e1e; --text: #e0e0e0; --cpu: #00d1b2; --mem: #209cee; --dsk: #ff3860; --net: #ffdd57; --accent: #bd93f9; }
         body { background-color: var(--bg); color: var(--text); font-family: 'Segoe UI', monospace; margin: 0; padding: 15px; box-sizing: border-box; overflow: hidden; }
         * { box-sizing: border-box; }
 
-        /* Header */
         .header { display: flex; flex-direction: column; gap: 15px; margin-bottom: 20px; border-bottom: 1px solid #333; padding-bottom: 15px; }
         .top-row { display: flex; justify-content: space-between; align-items: center; }
         .controls-row { display: flex; align-items: center; gap: 10px; background: #1a1a1a; padding: 5px 10px; border-radius: 6px; border: 1px solid #333; flex-wrap: wrap; }
 
-        /* Buttons */
         button { background: #333; border: none; color: #ccc; padding: 5px 10px; cursor: pointer; border-radius: 3px; font-size: 11px; transition: 0.2s; }
         button:hover { background: #555; color: white; }
         button.active { background: var(--cpu); color: #000; font-weight: bold; }
@@ -152,31 +152,27 @@ const htmlDashboard = `
         .badge.live { background: rgba(0, 209, 178, 0.2); color: var(--cpu); border: 1px solid var(--cpu); }
         .badge.hist { background: rgba(255, 221, 87, 0.2); color: var(--net); border: 1px solid var(--net); }
 
-        /* Grid */
         .grid-main { display: grid; grid-template-columns: 3fr 1fr; gap: 15px; height: calc(100vh - 180px); }
         .col-left { display: flex; flex-direction: column; gap: 15px; overflow-y: auto; padding-right: 5px; padding-bottom: 150px; }
         .col-right { display: flex; flex-direction: column; gap: 15px; overflow-y: auto; height: 100%; padding-bottom: 100px; }
 
-        /* Cards */
         .card { background: var(--card); border: 1px solid #333; border-radius: 6px; padding: 10px; position: relative; display: flex; flex-direction: column; overflow: hidden; }
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; height: 20px; flex-shrink: 0; }
         .card-title { font-size: 11px; color: #888; text-transform: uppercase; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; }
+        .legend { display: flex; gap: 10px; font-size: 10px; }
         .canvas-wrapper { flex: 1; position: relative; min-height: 0; width: 100%; }
         canvas { width: 100%; height: 100%; display: block; }
         
-        .legend { display: flex; gap: 10px; font-size: 10px; }
         .zoom-overlay { position: absolute; top: 5px; right: 5px; display: flex; gap: 2px; opacity: 0.3; transition: opacity 0.2s; z-index: 10; }
         .card:hover .zoom-overlay { opacity: 1; }
         .zoom-btn { padding: 2px 6px; font-size: 10px; background: #000; border: 1px solid #444; color: #fff; }
 
-        /* Drill Down */
         .drill-controls { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; background: #252525; padding: 10px; border-radius: 4px; flex-shrink: 0; }
         select { background: #111; color: #fff; border: 1px solid #444; padding: 5px; border-radius: 4px; width: 300px; }
         .drill-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; height: 260px; margin-top: 10px; display: none; }
         .drill-grid.active { display: grid; }
         .drill-item { border: 1px solid #333; padding: 5px; border-radius: 4px; display: flex; flex-direction: column; min-width: 0; }
 
-        /* Modal */
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 5000; justify-content: center; align-items: center; }
         .modal-content { background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #444; width: 600px; max-height: 90vh; overflow-y: auto; }
         .form-group { margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
@@ -184,14 +180,12 @@ const htmlDashboard = `
         .form-group input { width: 60%; }
         .section-title { border-bottom: 1px solid #444; margin: 15px 0 10px 0; font-size: 14px; color: var(--cpu); padding-bottom: 5px; }
 
-        /* Plugin Status */
         .status-0 { border-left: 3px solid #00d1b2; }
-        .status-1 { border-left: 3px solid #ffdd57; }
-        .status-2 { border-left: 3px solid #ff3860; }
+        .status-1 { border-left: 3px solid #ffdd57; } /* Warn */
+        .status-2 { border-left: 3px solid #ff3860; } /* Crit */
         .status-3 { border-left: 3px solid #888; }
         .plugin-row { display: flex; justify-content: flex-end; font-size: 10px; margin-left: 10px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 30%; }
 
-        /* Tables */
         .table-wrapper { overflow-y: auto; flex: 1; }
         table { width: 100%; border-collapse: collapse; font-size: 10px; }
         th { text-align: left; color: #666; padding: 4px; position: sticky; top: 0; background: var(--card); border-bottom: 1px solid #444; }
@@ -204,12 +198,11 @@ const htmlDashboard = `
 <body>
     <div id="tooltip"></div>
     
-    <!-- SETTINGS -->
     <div id="settings-modal" class="modal">
         <div class="modal-content">
             <h2 style="margin-top:0;">Configuration</h2>
             <div class="section-title">Custom Monitors (Nagios Scripts)</div>
-            <textarea id="in-scripts" style="width:100%; height: 80px; background:#111; color:#ccc; border:1px solid #444; font-family:monospace;"></textarea>
+            <textarea id="in-scripts" style="width:100%; height: 80px; background:#111; color:#ccc; border:1px solid #444; font-family:monospace;" placeholder="e.g. /root/check_disk.sh -w 90 -c 95"></textarea>
             <div class="section-title">Update Rates (Seconds)</div>
             <div class="form-group"><label>Global:</label><input type="number" id="in-int-g"></div>
             <div class="form-group"><label>Process:</label><input type="number" id="in-int-p"></div>
@@ -232,7 +225,7 @@ const htmlDashboard = `
 
     <div class="header">
         <div class="top-row">
-            <h1 style="margin:0; font-size: 20px;">PULSE <span style="color:#666; font-size:0.6em;">// PRECISION</span> <span id="mode-badge" class="badge live">LIVE</span></h1>
+            <h1 style="margin:0; font-size: 20px;">PULSE <span style="color:#666; font-size:0.6em;">// ENTERPRISE</span> <span id="mode-badge" class="badge live">LIVE</span></h1>
             <button onclick="openSettings()" style="margin-left:20px;">⚙️ SETTINGS</button>
         </div>
         <div class="controls-row">
@@ -250,11 +243,14 @@ const htmlDashboard = `
 
     <div class="grid-main">
         <div class="col-left">
-            <!-- Charts -->
             <div class="card" style="height: 250px; min-height: 250px;">
-                <div class="card-header"><div class="card-title">Resources</div><div class="legend"><span style="color:#00d1b2">● CPU</span> <span style="color:#209cee">● RAM</span></div></div>
+                <div class="card-header">
+                    <div class="card-title">System Resources</div>
+                    <div class="legend"><span style="color:#00d1b2">● CPU</span> <span style="color:#209cee">● RAM</span></div>
+                </div>
                 <div class="canvas-wrapper"><canvas id="c-global"></canvas><div class="zoom-overlay"><button class="zoom-btn" onclick="zoomIn()">+</button><button class="zoom-btn" onclick="zoomOut()">-</button></div></div>
             </div>
+
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; height: 180px; min-height: 180px;">
                 <div class="card">
                     <div class="card-header"><div class="card-title">Network</div><div class="legend"><span style="color:#ffdd57">● Rx</span> <span style="color:#bd93f9">● Tx</span></div></div>
@@ -266,10 +262,8 @@ const htmlDashboard = `
                 </div>
             </div>
 
-            <!-- Plugins -->
             <div id="plugin-container"></div>
 
-            <!-- Process -->
             <div class="card" style="height: auto; min-height: 350px;">
                 <div class="card-header"><div class="card-title">Process Inspector</div></div>
                 <div style="display:flex; gap:10px; margin-bottom:10px;">
@@ -284,7 +278,6 @@ const htmlDashboard = `
             </div>
         </div>
 
-        <!-- Lists -->
         <div class="col-right">
             <div class="card" style="height: 25%;"><div class="card-title">Top CPU</div><div class="table-wrapper"><table id="tbl-cpu"></table></div></div>
             <div class="card" style="height: 25%;"><div class="card-title">Top Mem</div><div class="table-wrapper"><table id="tbl-mem"></table></div></div>
@@ -357,10 +350,8 @@ const htmlDashboard = `
                 for(let i=0;i<=4;i++) {
                     let y=(h-pB)-(i*(h-pB)/4); this.ctx.moveTo(pL,y); this.ctx.lineTo(w,y);
                     let v=i*(max/4); let t=v.toFixed(0);
-                    
                     if(this.unit === 'B' || (this.unit === undefined && (this.c1.includes('57') || this.c1.includes('38') || this.c1.includes('20') || (this.c2 && this.c2.includes('00'))))) t=fmtBytes(v);
                     if(this.unit === '%' || this.max === 100) t+='%';
-                    
                     this.ctx.fillText(t, 2, y+3);
                 }
                 this.ctx.stroke();
@@ -494,7 +485,7 @@ const htmlDashboard = `
 </html>
 `
 
-// --- 4. BACKEND LOGIC ---
+// --- 4. BACKEND ---
 
 func loadConfig() {
 	if _, err := os.Stat(confFile); err == nil {
@@ -522,8 +513,12 @@ func saveConfig() {
 }
 
 func runPlugin(commandLine string) PluginData {
-	// Execute with SH to allow flags and arguments
-	cmd := exec.Command("sh", "-c", commandLine)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", commandLine)
+	} else {
+		cmd = exec.Command("sh", "-c", commandLine)
+	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
@@ -539,14 +534,11 @@ func runPlugin(commandLine string) PluginData {
 
 	if len(parts) > 1 {
 		perf := strings.TrimSpace(parts[1])
-		// Regex to capture first metric key=value[unit]
 		re := regexp.MustCompile(`=([-0-9.]+)([a-zA-Z%]*)`)
 		matches := re.FindStringSubmatch(perf)
 		if len(matches) >= 2 {
 			val, _ = strconv.ParseFloat(matches[1], 64)
-			if len(matches) > 2 {
-				unit = matches[2]
-			}
+			if len(matches) > 2 { unit = matches[2] }
 		}
 	}
 	return PluginData{Path: commandLine, ExitCode: code, Output: msg, PerfVal: val, PerfUnit: unit}
@@ -554,27 +546,58 @@ func runPlugin(commandLine string) PluginData {
 
 func checkAlerts(m RichMetrics) {
 	cfgMutex.RLock(); defer cfgMutex.RUnlock()
+	// Standard Thresholds
 	check := func(n string, v, w, c float64) {
 		if w==0 && c==0 { return }
 		lvl := ""
 		if v >= c { lvl = "CRITICAL" } else if v >= w { lvl = "WARNING" }
-		if lvl != "" { sendAlertEmail(n, lvl, v) }
+		if lvl != "" { sendAlertEmail(n, lvl, v, "") }
 	}
 	check("CPU", m.CPUTotal, config.CpuWarn, config.CpuCrit)
 	check("Memory", m.MemUsed, config.MemWarn, config.MemCrit)
 	check("Disk", m.DiskUsed, config.DskWarn, config.DskCrit)
+
+	// Plugin Alerts
+	for _, p := range m.Plugins {
+		if p.ExitCode == 1 { sendAlertEmail(p.Path, "WARNING", p.PerfVal, p.Output) }
+		if p.ExitCode == 2 { sendAlertEmail(p.Path, "CRITICAL", p.PerfVal, p.Output) }
+	}
 }
 
-func sendAlertEmail(m, l string, v float64) {
+func sendAlertEmail(name, level string, val float64, extraMsg string) {
 	if config.SmtpHost == "" { return }
 	alertMutex.Lock(); defer alertMutex.Unlock()
-	k := m + l
-	if t, ok := lastEmailTime[k]; ok { if time.Since(t) < 15*time.Minute { return } }
-	lastEmailTime[k] = time.Now()
+	
+	key := name + level
+	if t, ok := lastEmailTime[key]; ok { if time.Since(t) < 15*time.Minute { return } }
+	lastEmailTime[key] = time.Now()
+
 	go func() {
-		a := smtp.PlainAuth("", config.SmtpUser, config.SmtpPass, config.SmtpHost)
-		msg := []byte(fmt.Sprintf("To: %s\r\nSubject: Pulse Alert: %s\r\n\r\n%s is %s (%.2f%%)", config.EmailTo, l, m, l, v))
-		smtp.SendMail(fmt.Sprintf("%s:%d", config.SmtpHost, config.SmtpPort), a, config.SmtpUser, []string{config.EmailTo}, msg)
+		msg := fmt.Sprintf("To: %s\r\nSubject: Pulse Alert: %s %s\r\n\r\nMonitor: %s\nStatus: %s\nValue: %.2f\nMessage: %s\nHost: %s", 
+			config.EmailTo, level, name, name, level, val, extraMsg, latestMetric.Hostname)
+		
+		addr := fmt.Sprintf("%s:%d", config.SmtpHost, config.SmtpPort)
+		var err error
+		if config.SmtpPort == 465 {
+			// Implicit SSL
+			tlsConfig := &tls.Config{InsecureSkipVerify: true, ServerName: config.SmtpHost}
+			conn, e := tls.Dial("tcp", addr, tlsConfig); if e != nil { return }
+			c, e := smtp.NewClient(conn, config.SmtpHost); if e != nil { return }
+			auth := smtp.PlainAuth("", config.SmtpUser, config.SmtpPass, config.SmtpHost)
+			if err = c.Auth(auth); err == nil {
+				if err = c.Mail(config.SmtpUser); err == nil {
+					if err = c.Rcpt(config.EmailTo); err == nil {
+						w, _ := c.Data(); w.Write([]byte(msg)); w.Close()
+					}
+				}
+			}
+			c.Quit()
+		} else {
+			// STARTTLS
+			auth := smtp.PlainAuth("", config.SmtpUser, config.SmtpPass, config.SmtpHost)
+			err = smtp.SendMail(addr, auth, config.SmtpUser, []string{config.EmailTo}, []byte(msg))
+		}
+		if err != nil { fmt.Println("Email Error:", err) }
 	}()
 }
 
@@ -715,5 +738,5 @@ func main() {
 			}
 		}
 	})
-	fmt.Println("PULSE v27: SHELL EXECUTION FIX"); fmt.Println("http://localhost:8080"); http.ListenAndServe(":8080", nil)
+	fmt.Println("PULSE v30: FULL ALERTING SUITE"); fmt.Println("http://localhost:8080"); http.ListenAndServe(":8080", nil)
 }
